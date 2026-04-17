@@ -1,7 +1,6 @@
-streamlit
-plotly
-pandas
-fpdf2
-Pillow
-opencv-python-headless
+streamlit>=1.28
 requests
+pillow
+opencv-python-headless
+pandas
+reportlab
