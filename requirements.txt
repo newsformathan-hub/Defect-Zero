@@ -3,4 +3,3 @@ requests
 pillow
 opencv-python-headless
 pandas
-reportlab
