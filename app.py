@@ -7,9 +7,9 @@ import io, base64
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, HRFlowable
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, HRFlowable, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 
 st.set_page_config(page_title="SolderSense AI | Data Patterns", page_icon="\U0001f52c", layout="wide")
 
@@ -46,6 +46,10 @@ CLASS_COLORS = {
     "spur":(180,50,255),"spurious_copper":(0,220,220),
 }
 
+# Store annotated images in session state
+if "inspection_images" not in st.session_state:
+    st.session_state.inspection_images = {}
+
 def init_db():
     c = sqlite3.connect(DB_PATH)
     c.execute("""CREATE TABLE IF NOT EXISTS inspections (
@@ -59,7 +63,9 @@ def save_inspection(filename, verdict, n, classes, conf):
     c.execute("INSERT INTO inspections VALUES (NULL,?,?,?,?,?,?)",
         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), filename, verdict, n,
          ",".join(classes) if classes else "none", conf))
+    last_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     c.commit(); c.close()
+    return last_id
 
 def call_roboflow(img_bytes, api_key, conf=35):
     resp = requests.post(
@@ -85,69 +91,222 @@ def draw_boxes(img_pil, data, orig_w, orig_h):
         draw.text((x+3,y-19), lbl, fill="white")
     return img
 
-def generate_pdf(df, logo_b64):
+def pil_to_rl_image(img_pil, max_w_mm=80, max_h_mm=60):
+    """Convert PIL image to ReportLab Image, scaled to fit max dimensions."""
+    buf = io.BytesIO()
+    img_pil.save(buf, format="PNG")
+    buf.seek(0)
+    w, h = img_pil.size
+    scale = min((max_w_mm*mm)/w, (max_h_mm*mm)/h)
+    return RLImage(buf, width=w*scale, height=h*scale)
+
+def generate_pdf(df, logo_b64, inspection_images):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
-          topMargin=18*mm, bottomMargin=18*mm,
-          leftMargin=18*mm, rightMargin=18*mm)
+          topMargin=15*mm, bottomMargin=15*mm,
+          leftMargin=15*mm, rightMargin=15*mm)
     story = []
-    rl_logo = RLImage(io.BytesIO(base64.b64decode(logo_b64)), width=48*mm, height=14*mm)
-    t_s = ParagraphStyle("t",fontSize=16,fontName="Helvetica-Bold",
-                         textColor=colors.HexColor("#cc0000"),alignment=TA_LEFT)
-    s_s = ParagraphStyle("s",fontSize=8,fontName="Helvetica",
-                         textColor=colors.HexColor("#666666"),alignment=TA_LEFT)
-    hdr = Table([[
-        [Paragraph("SolderSense AI",t_s),
-         Paragraph("PCB Defect Detection System  |  Data Patterns",s_s)],
-        rl_logo]], colWidths=[118*mm,52*mm])
-    hdr.setStyle(TableStyle([
-        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),("ALIGN",(1,0),(1,0),"RIGHT"),
-        ("LINEBELOW",(0,0),(-1,0),1,colors.HexColor("#cc0000")),
-        ("BOTTOMPADDING",(0,0),(-1,0),6)]))
-    story.append(hdr); story.append(Spacer(1,5*mm))
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ms  = ParagraphStyle("ms",fontSize=9,textColor=colors.HexColor("#333333"))
-    pn  = len(df[df["verdict"]=="PASS"])
-    fn  = len(df[df["verdict"]=="FAIL"])
-    rn  = len(df[df["verdict"]=="REVIEW"])
-    rt  = f"{100*pn/len(df):.1f}%" if len(df) else "N/A"
-    story += [
-        Paragraph(f"<b>Report Generated:</b> {now}", ms),
-        Paragraph(f"<b>Total:</b> {len(df)}  <b>Pass:</b> {pn}  <b>Fail:</b> {fn}  <b>Review:</b> {rn}  <b>Pass Rate:</b> {rt}", ms),
-        Spacer(1,4*mm),
-        HRFlowable(width="100%",thickness=0.5,color=colors.HexColor("#cccccc")),
-        Spacer(1,4*mm),
-        Paragraph("Inspection Log", ParagraphStyle("h2",fontSize=12,
-            fontName="Helvetica-Bold",textColor=colors.HexColor("#8b0000"))),
-        Spacer(1,3*mm),
+    page_w = A4[0] - 30*mm  # usable width
+
+    # ── Styles ────────────────────────────────────────────────────────────
+    title_s  = ParagraphStyle("title", fontSize=18, fontName="Helvetica-Bold",
+                               textColor=colors.HexColor("#cc0000"), alignment=TA_LEFT)
+    sub_s    = ParagraphStyle("sub",   fontSize=9,  fontName="Helvetica",
+                               textColor=colors.HexColor("#666666"), alignment=TA_LEFT)
+    meta_s   = ParagraphStyle("meta",  fontSize=9,  fontName="Helvetica",
+                               textColor=colors.HexColor("#333333"), spaceAfter=3)
+    label_s  = ParagraphStyle("label", fontSize=8,  fontName="Helvetica-Bold",
+                               textColor=colors.HexColor("#444444"))
+    val_s    = ParagraphStyle("val",   fontSize=8,  fontName="Helvetica",
+                               textColor=colors.HexColor("#222222"))
+    head_s   = ParagraphStyle("head",  fontSize=12, fontName="Helvetica-Bold",
+                               textColor=colors.HexColor("#8b0000"), spaceBefore=6, spaceAfter=4)
+    foot_s   = ParagraphStyle("foot",  fontSize=7,  alignment=TA_CENTER,
+                               textColor=colors.HexColor("#999999"))
+    defect_s = ParagraphStyle("defect",fontSize=9,  fontName="Helvetica-Bold",
+                               textColor=colors.HexColor("#cc0000"), spaceBefore=8)
+    cap_s    = ParagraphStyle("cap",   fontSize=8,  fontName="Helvetica",
+                               textColor=colors.HexColor("#555555"), alignment=TA_CENTER)
+
+    now = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+
+    # ── Header: logo RIGHT, title LEFT ───────────────────────────────────
+    rl_logo = RLImage(io.BytesIO(base64.b64decode(logo_b64)),
+                      width=44*mm, height=13*mm)
+
+    hdr_tbl = Table(
+        [[Paragraph("SolderSense AI", title_s), rl_logo],
+         [Paragraph("PCB Defect Detection System  |  Data Patterns", sub_s), ""]],
+        colWidths=[page_w - 48*mm, 48*mm]
+    )
+    hdr_tbl.setStyle(TableStyle([
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+        ("ALIGN",         (1,0), (1,1),   "RIGHT"),
+        ("SPAN",          (1,0), (1,1)),
+        ("TOPPADDING",    (0,0), (-1,-1), 2),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 2),
+    ]))
+    story.append(hdr_tbl)
+    story.append(HRFlowable(width="100%", thickness=1.5,
+                            color=colors.HexColor("#cc0000")))
+    story.append(Spacer(1, 4*mm))
+
+    # ── Summary block ─────────────────────────────────────────────────────
+    pn = len(df[df["verdict"]=="PASS"])
+    fn = len(df[df["verdict"]=="FAIL"])
+    rn = len(df[df["verdict"]=="REVIEW"])
+    rt = f"{100*pn/len(df):.1f}%" if len(df) else "N/A"
+
+    summary_data = [
+        [Paragraph("Report Generated", label_s), Paragraph(now, val_s),
+         Paragraph("Total Inspections", label_s), Paragraph(str(len(df)), val_s)],
+        [Paragraph("Pass ✓", label_s),  Paragraph(str(pn), val_s),
+         Paragraph("Fail ✗", label_s),  Paragraph(str(fn), val_s)],
+        [Paragraph("Review ⚠", label_s), Paragraph(str(rn), val_s),
+         Paragraph("Pass Rate", label_s), Paragraph(rt, val_s)],
     ]
-    rows = [["#","Timestamp","Filename","Verdict","Defects","Classes","Conf"]]
-    for _,r in df.iterrows():
-        rows.append([str(r.get("id","")),str(r.get("timestamp",""))[:16],
-            str(r.get("filename",""))[:25],str(r.get("verdict","")),
-            str(r.get("defect_count",0)),str(r.get("defect_classes",""))[:28],
-            f"{float(r.get('confidence',0)):.2f}"])
-    tbl = Table(rows,colWidths=[10,35,44,20,15,42,14],repeatRows=1)
-    vc  = {"PASS":colors.HexColor("#d4edda"),"FAIL":colors.HexColor("#f8d7da"),
-            "REVIEW":colors.HexColor("#fff3cd")}
-    ts  = [("BACKGROUND",(0,0),(-1,0),colors.HexColor("#8b0000")),
-           ("TEXTCOLOR",(0,0),(-1,0),colors.white),
-           ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
-           ("FONTSIZE",(0,0),(-1,-1),7),("ALIGN",(0,0),(-1,-1),"CENTER"),
-           ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-           ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#f9f9f9")]),
-           ("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#cccccc")),
-           ("TOPPADDING",(0,0),(-1,-1),3),("BOTTOMPADDING",(0,0),(-1,-1),3)]
-    for i,row in enumerate(rows[1:],1):
-        if row[3] in vc: ts.append(("BACKGROUND",(3,i),(3,i),vc[row[3]]))
-    tbl.setStyle(TableStyle(ts)); story.append(tbl)
-    story += [Spacer(1,8*mm),
-        HRFlowable(width="100%",thickness=0.5,color=colors.HexColor("#cccccc")),
-        Spacer(1,3*mm),
-        Paragraph(f"Confidential — SolderSense AI  |  Data Patterns  |  {now}",
-            ParagraphStyle("ft",fontSize=7,alignment=TA_CENTER,
-                           textColor=colors.HexColor("#999999")))]
-    doc.build(story); buf.seek(0); return buf.read()
+    sum_tbl = Table(summary_data,
+                    colWidths=[32*mm, 50*mm, 32*mm, 36*mm])
+    sum_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), colors.HexColor("#fafafa")),
+        ("BACKGROUND",    (0,0), (0,-1), colors.HexColor("#f0f0f0")),
+        ("BACKGROUND",    (2,0), (2,-1), colors.HexColor("#f0f0f0")),
+        ("BOX",           (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+        ("INNERGRID",     (0,0), (-1,-1), 0.3, colors.HexColor("#dddddd")),
+        ("TOPPADDING",    (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ("LEFTPADDING",   (0,0), (-1,-1), 6),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 6),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+    ]))
+    story.append(sum_tbl)
+    story.append(Spacer(1, 6*mm))
+
+    # ── Inspection log table ──────────────────────────────────────────────
+    story.append(Paragraph("Inspection Log", head_s))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                            color=colors.HexColor("#cccccc")))
+    story.append(Spacer(1, 2*mm))
+
+    col_w = [10*mm, 32*mm, 42*mm, 18*mm, 14*mm, 38*mm, 12*mm]
+    rows  = [[
+        Paragraph("<b>#</b>",         label_s),
+        Paragraph("<b>Timestamp</b>", label_s),
+        Paragraph("<b>Filename</b>",  label_s),
+        Paragraph("<b>Verdict</b>",   label_s),
+        Paragraph("<b>Defects</b>",   label_s),
+        Paragraph("<b>Classes</b>",   label_s),
+        Paragraph("<b>Conf</b>",      label_s),
+    ]]
+    vc = {"PASS":  colors.HexColor("#d4edda"),
+           "FAIL":  colors.HexColor("#f8d7da"),
+           "REVIEW":colors.HexColor("#fff3cd")}
+    row_styles = []
+    for idx, (_, r) in enumerate(df.iterrows(), start=1):
+        v = str(r.get("verdict",""))
+        rows.append([
+            Paragraph(str(r.get("id","")),                   val_s),
+            Paragraph(str(r.get("timestamp",""))[:16],        val_s),
+            Paragraph(str(r.get("filename",""))[:28],         val_s),
+            Paragraph(f"<b>{v}</b>",                        label_s),
+            Paragraph(str(r.get("defect_count",0)),           val_s),
+            Paragraph(str(r.get("defect_classes",""))[:30],   val_s),
+            Paragraph(f"{float(r.get('confidence',0)):.2f}", val_s),
+        ])
+        if v in vc:
+            row_styles.append(("BACKGROUND",(3,idx),(3,idx), vc[v]))
+
+    log_tbl = Table(rows, colWidths=col_w, repeatRows=1)
+    ts = [
+        ("BACKGROUND",    (0,0), (-1,0),  colors.HexColor("#8b0000")),
+        ("TEXTCOLOR",     (0,0), (-1,0),  colors.white),
+        ("ROWBACKGROUNDS",(0,1), (-1,-1), [colors.white, colors.HexColor("#f9f9f9")]),
+        ("BOX",           (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+        ("INNERGRID",     (0,0), (-1,-1), 0.3, colors.HexColor("#dddddd")),
+        ("TOPPADDING",    (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ("LEFTPADDING",   (0,0), (-1,-1), 5),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 5),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+    ] + row_styles
+    log_tbl.setStyle(TableStyle(ts))
+    story.append(log_tbl)
+
+    # ── Defect images section ─────────────────────────────────────────────
+    defect_rows = df[df["verdict"].isin(["FAIL","REVIEW"])]
+
+    if not defect_rows.empty and inspection_images:
+        story.append(Spacer(1, 8*mm))
+        story.append(Paragraph("Defect Images", head_s))
+        story.append(HRFlowable(width="100%", thickness=0.5,
+                                color=colors.HexColor("#cccccc")))
+        story.append(Spacer(1, 3*mm))
+
+        # 2 images per row
+        img_pairs = []
+        current_pair = []
+
+        for _, r in defect_rows.iterrows():
+            rid = int(r.get("id", 0))
+            if rid not in inspection_images:
+                continue
+
+            annotated_pil = inspection_images[rid]
+            rl_img = pil_to_rl_image(annotated_pil, max_w_mm=82, max_h_mm=65)
+
+            verdict = str(r.get("verdict",""))
+            vcolor  = "#cc0000" if verdict=="FAIL" else "#cc8800"
+
+            cell = [
+                rl_img,
+                Paragraph(f'<font color="{vcolor}"><b>{verdict}</b></font>  {str(r.get("filename",""))[:30]}', val_s),
+                Paragraph(f'Classes: {str(r.get("defect_classes",""))}', val_s),
+                Paragraph(f'Defects: {r.get("defect_count",0)}  |  Conf: {float(r.get("confidence",0)):.2f}', val_s),
+                Paragraph(str(r.get("timestamp",""))[:16], val_s),
+            ]
+            current_pair.append(cell)
+
+            if len(current_pair) == 2:
+                img_pairs.append(current_pair)
+                current_pair = []
+
+        if current_pair:  # odd one out
+            current_pair.append([""])  # empty second cell
+            img_pairs.append(current_pair)
+
+        for pair in img_pairs:
+            left_cell  = pair[0]
+            right_cell = pair[1] if len(pair) > 1 else [""]
+
+            pair_tbl = Table(
+                [[left_cell, right_cell]],
+                colWidths=[page_w/2 - 3*mm, page_w/2 - 3*mm]
+            )
+            pair_tbl.setStyle(TableStyle([
+                ("VALIGN",        (0,0), (-1,-1), "TOP"),
+                ("LEFTPADDING",   (0,0), (-1,-1), 4),
+                ("RIGHTPADDING",  (0,0), (-1,-1), 4),
+                ("TOPPADDING",    (0,0), (-1,-1), 4),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+                ("BOX",           (0,0), (0,0),   0.5, colors.HexColor("#dddddd")),
+                ("BOX",           (1,0), (1,0),   0.5, colors.HexColor("#dddddd")),
+                ("BACKGROUND",    (0,0), (-1,-1), colors.HexColor("#fafafa")),
+            ]))
+            story.append(pair_tbl)
+            story.append(Spacer(1, 3*mm))
+
+    # ── Footer ────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 6*mm))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                            color=colors.HexColor("#cccccc")))
+    story.append(Spacer(1, 2*mm))
+    story.append(Paragraph(
+        f"Confidential — SolderSense AI  |  Data Patterns  |  Generated {now}",
+        foot_s))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
 
 init_db()
 
@@ -182,8 +341,8 @@ with tab1:
                 else:
                     verdict = "REVIEW"; st.warning("## \u26a0\ufe0f REVIEW")
                 st.caption(f"Inference: {elapsed:.2f}s | Detections: {len(dp)}")
-                st.image(draw_boxes(img_pil,data,orig_w,orig_h),
-                         caption="Annotated Result", use_column_width=True)
+                annotated = draw_boxes(img_pil, data, orig_w, orig_h)
+                st.image(annotated, caption="Annotated Result", use_column_width=True)
                 if dp:
                     st.dataframe(pd.DataFrame([{
                         "Class":p["class"],"Confidence":f'{p["confidence"]:.2f}',
@@ -191,7 +350,10 @@ with tab1:
                     } for p in dp]), use_container_width=True)
                 classes  = list(set(p["class"] for p in dp))
                 avg_conf = round(sum(p["confidence"] for p in dp)/len(dp),3) if dp else 0.0
-                save_inspection(uploaded.name, verdict, len(dp), classes, avg_conf)
+                last_id  = save_inspection(uploaded.name, verdict, len(dp), classes, avg_conf)
+                # Store annotated image in session state for PDF
+                if verdict in ("FAIL","REVIEW"):
+                    st.session_state.inspection_images[last_id] = annotated
         elif uploaded and not api_key:
             st.warning("Enter your Roboflow API key above.")
         else:
@@ -206,7 +368,7 @@ with tab2:
     else:
         c1,c2,c3 = st.columns(3)
         c1.metric("Total Inspections", len(df))
-        c2.metric("Defects Found", len(df[df["verdict"]=="FAIL"]))
+        c2.metric("Defects Found",     len(df[df["verdict"]=="FAIL"]))
         c3.metric("Pass Rate", f'{100*len(df[df["verdict"]=="PASS"])/len(df):.1f}%')
         st.bar_chart(df["verdict"].value_counts())
         st.dataframe(df, use_container_width=True)
@@ -216,19 +378,28 @@ with tab3:
     df   = pd.read_sql("SELECT * FROM inspections ORDER BY id DESC", conn)
     conn.close()
     st.markdown("#### Export Defect Report")
+
     if df.empty:
         st.info("No data to export yet.")
     else:
+        n_imgs = len(st.session_state.inspection_images)
+        if n_imgs > 0:
+            st.success(f"\u2705 {n_imgs} annotated defect image(s) ready for PDF")
+        else:
+            st.info("\u2139\ufe0f Run Live Inspections this session to include annotated images in the PDF.")
+
         c1,c2 = st.columns(2)
         with c1:
             st.download_button("\U0001f4e5 Download CSV",
-                df.to_csv(index=False),"soldersense_report.csv","text/csv",
+                df.to_csv(index=False), "soldersense_report.csv", "text/csv",
                 use_container_width=True)
         with c2:
-            pdf_bytes = generate_pdf(df, DP_LOGO_B64)
+            with st.spinner("Building PDF…"):
+                pdf_bytes = generate_pdf(df, DP_LOGO_B64,
+                                         st.session_state.inspection_images)
             st.download_button("\U0001f4c4 Download PDF Report",
-                pdf_bytes,"soldersense_defect_report.pdf","application/pdf",
+                pdf_bytes, "soldersense_defect_report.pdf", "application/pdf",
                 use_container_width=True)
-        st.caption("PDF includes Data Patterns logo, summary and full inspection log.")
+        st.caption("PDF includes Data Patterns logo, summary, inspection log and annotated defect images.")
 
 st.markdown("<br><center style=\'color:#444;font-size:11px\'>SolderSense AI &nbsp;|&nbsp; Data Patterns &nbsp;|&nbsp; Confidential</center>",unsafe_allow_html=True)
